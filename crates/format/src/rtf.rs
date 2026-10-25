@@ -57,9 +57,17 @@ pub fn slides_to_rtf(p: &Presentation) -> String {
     for s in &p.slides {
         let title = s.shapes.iter().find(|sh| sh.ph_type().is_some_and(|k| k.is_title())).and_then(|sh| sh.text.as_ref());
         out.push_str("\\pard\\outlinelevel0\\sb240\\b\\fs32 ");
-        match title.and_then(|t| t.paragraphs.iter().find(|p| !p.is_empty())) {
-            Some(tp) => runs(&mut out, tp),
-            None => escape(&mut out, &s.title()),
+        // The title stays one outline paragraph (a `\par` would start another slide on re-import),
+        // so its paragraphs are joined with line breaks.
+        let mut tps = title.into_iter().flat_map(|t| &t.paragraphs).filter(|p| !p.is_empty()).peekable();
+        if tps.peek().is_none() {
+            escape(&mut out, &s.title());
+        }
+        for (k, tp) in tps.enumerate() {
+            if k > 0 {
+                out.push_str("\\line ");
+            }
+            runs(&mut out, tp);
         }
         out.push_str("\\b0\\par\n");
         for sh in &s.shapes {
@@ -104,6 +112,12 @@ const SKIP: &[&str] = &[
     "rsidtbl",
     "object",
     "fldinst",
+    // A list item's rendered bullet or number, written before its text (Word: listtext; RTF 1.5 and
+    // older writers: pntext, pntxta, pntxtb). Its `\pard` must not reset the paragraph's indent.
+    "listtext",
+    "pntext",
+    "pntxta",
+    "pntxtb",
 ];
 
 /// `i + n`, or one character on when that would land inside a multi-byte character (a fallback
@@ -223,7 +237,7 @@ pub fn rtf_to_outline(rtf: &str) -> String {
                         _ => {}
                     }
                 } else if n == b'\'' {
-                    let hex = rtf.get(i + 1..i + 3).and_then(|h| u8::from_str_radix(h, 16).ok());
+                    let hex = rtf.get(i + 1..i + 3).filter(|h| h.bytes().all(|b| b.is_ascii_hexdigit())).and_then(|h| u8::from_str_radix(h, 16).ok());
                     i = advance(rtf, i, 3);
                     if !st.skip
                         && let Some(h) = hex
@@ -239,6 +253,7 @@ pub fn rtf_to_outline(rtf: &str) -> String {
                     match n {
                         b'\\' | b'{' | b'}' => line.push(n as char),
                         b'~' => line.push('\u{a0}'),
+                        b'_' => line.push('\u{2011}'),
                         b'\n' | b'\r' => flush(&mut line, level, indent, &mut out),
                         _ => {}
                     }
@@ -318,6 +333,12 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
 
+    /// A sign in a `\'hh` escape is not a hex digit and must be ignored.
+    #[test]
+    fn hex_escape_rejects_sign() {
+        assert_eq!(rtf_to_outline(r"{\rtf1 a\'+5b\par}"), "ab\n");
+    }
+
     /// Non-ASCII text after a `\\uN` or `\\'hh` escape used to split a character and panic.
     #[test]
     fn non_ascii_text_after_escapes_does_not_panic() {
@@ -335,6 +356,12 @@ mod tests {
         assert_eq!(rtf_to_outline(r"{\rtf1 a\'00bé\par}"), "abé\n");
         assert_eq!(rtf_to_outline("{\\rtf1 a\0b\\par}\0\0"), "ab\n");
         assert_eq!(rtf_to_outline(r"{\rtf1 x\u-70000?y\par}"), "x\u{ee90}y\n");
+    }
+
+    /// `\\_` is RTF's non-breaking hyphen: a visible character, not markup.
+    #[test]
+    fn non_breaking_hyphen_is_kept() {
+        assert_eq!(rtf_to_outline(r"{\rtf1\pard Year\_end review\par}"), "Year\u{2011}end review\n");
     }
 
     /// A hostile `\li` near `i64::MAX` overflowed the rounding addend in debug builds.
@@ -355,9 +382,30 @@ mod tests {
         assert_eq!(rtf_to_outline(&rtf), crate::slides_to_outline(&p));
     }
 
+    /// A title with two paragraphs: the plain outline keeps both, the RTF export kept only the first.
+    #[test]
+    fn every_title_paragraph_is_exported() {
+        let mut p = deckcraft_model::defaults::blank_presentation(deckcraft_model::defaults::WIDE, Default::default(), false);
+        crate::outline_to_slides(&mut p, "First line\n\tBody\n");
+        let slide = std::sync::Arc::make_mut(&mut p.slides[0]);
+        let title = slide.shapes.iter_mut().find(|sh| sh.ph_type().is_some_and(|k| k.is_title())).and_then(|sh| sh.text.as_mut()).unwrap();
+        title.paragraphs.push(Paragraph::new("Second line"));
+        let rtf = slides_to_rtf(&p);
+        assert!(rtf.contains("First line\\line Second line\\b0\\par"), "{rtf}");
+        assert_eq!(rtf_to_outline(&rtf), crate::slides_to_outline(&p));
+    }
+
     #[test]
     fn reads_word_style_rtf_by_indent_and_hex_escapes() {
         let rtf = r"{\rtf1\ansi{\fonttbl{\f0 Arial;}}{\*\generator X;}\pard\b Title one\b0\par\pard\li720 Point \'93a\'94\par\pard\li1440 Sub\par}";
         assert_eq!(rtf_to_outline(rtf), "Title one\n\t\tPoint “a”\n\t\t\t\tSub\n");
+    }
+
+    /// Word writes a list item's bullet as `{\\listtext\\pard\\plain …\\'b7\\tab}` (older writers:
+    /// `{\\pntext …}`) after the paragraph's own `\\li`. That group is the rendered bullet, not text.
+    #[test]
+    fn word_list_bullets_are_not_text_and_keep_the_indent() {
+        let rtf = r"{\rtf1\ansi\pard Title\par\pard\fi-360\li720{\listtext\pard\plain\f1\'b7\tab}Point\par\pard\li720{\pntext\f1\'b7\tab}Old\par}";
+        assert_eq!(rtf_to_outline(rtf), "Title\n\t\tPoint\n\t\tOld\n");
     }
 }

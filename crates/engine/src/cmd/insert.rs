@@ -8,7 +8,10 @@ use deckcraft_model::text::{AutoFit, RunKind, TextBody};
 use deckcraft_model::{Chart, ColorRef, Fill, Geom, Line, MediaClip, Shape, ShapeId, ShapeKind, ShapeStyle, Table};
 use serde_json::{Value, json};
 
-use super::*;
+use super::{
+    CommandSpec, NO_ID_SPACE, always, bad, base64_decode, base64_encode, bool_or, bool_param, cmd, color_value, edit_shapes, has_doc, has_selection,
+    has_slide, has_text_or_shapes, ok, rect_param, str_param, usize_param, xfrm_of,
+};
 use crate::{EngineError, Result, Session};
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -149,27 +152,38 @@ fn default_rect(s: &Session, w: f64, h: f64) -> Xfrm {
     Xfrm::new((size.width - w) / 2.0, (size.height - h) / 2.0, w, h)
 }
 
+/// The word an automatic shape name starts with ("Rectangle" in "Rectangle 3").
+pub(crate) fn auto_name_base(shape: &Shape) -> String {
+    match &shape.kind {
+        ShapeKind::Picture { .. } => "Picture".to_string(),
+        ShapeKind::Table(_) => "Table".to_string(),
+        ShapeKind::Chart(_) => "Chart".to_string(),
+        ShapeKind::Media(m) if m.video => "Video".to_string(),
+        ShapeKind::Media(_) => "Audio".to_string(),
+        ShapeKind::Model3d { .. } => "3D Model".to_string(),
+        _ if shape.text_box => "TextBox".to_string(),
+        _ => shape
+            .geom
+            .preset_name()
+            .and_then(deckcraft_geom::preset::info)
+            .map(|i| i.label.split(':').next().unwrap_or(i.label).trim().to_string())
+            .unwrap_or_else(|| "Shape".into()),
+    }
+}
+
+/// "{base} n" with the first `n` from the shape count + 1 that no shape on the slide already uses,
+/// so a gap left by a deleted shape never makes a second shape with the same name.
+pub(crate) fn first_free_name(base: &str, taken: &std::collections::HashSet<String>) -> String {
+    (taken.len() + 1..).map(|n| format!("{base} {n}")).find(|c| !taken.contains(c)).unwrap_or_default()
+}
+
 pub(crate) fn add_shape(s: &mut Session, cmd: &str, mut shape: Shape, select: bool) -> Result<ShapeId> {
     s.edit(|doc, sel| {
         shape.id = ShapeId(doc.alloc_id().ok_or_else(|| bad(cmd, NO_ID_SPACE))?);
         if shape.name.is_empty() {
-            let base = match &shape.kind {
-                ShapeKind::Picture { .. } => "Picture".to_string(),
-                ShapeKind::Table(_) => "Table".to_string(),
-                ShapeKind::Chart(_) => "Chart".to_string(),
-                ShapeKind::Media(m) if m.video => "Video".to_string(),
-                ShapeKind::Media(_) => "Audio".to_string(),
-                ShapeKind::Model3d { .. } => "3D Model".to_string(),
-                _ if shape.text_box => "TextBox".to_string(),
-                _ => shape
-                    .geom
-                    .preset_name()
-                    .and_then(deckcraft_geom::preset::info)
-                    .map(|i| i.label.split(':').next().unwrap_or(i.label).trim().to_string())
-                    .unwrap_or_else(|| "Shape".into()),
-            };
-            let n = super::current_shapes(doc, sel).map(|v| v.len()).unwrap_or(0) + 1;
-            shape.name = format!("{base} {n}");
+            let base = auto_name_base(&shape);
+            let taken = super::current_names(doc, sel);
+            shape.name = first_free_name(&base, &taken);
         }
         let id = shape.id;
         let list = crate::shapes_mut(doc, sel).ok_or_else(|| bad("insert", "no slide"))?;
@@ -1278,14 +1292,25 @@ fn media(s: &mut Session, p: &Value, video: bool) -> Result<Value> {
         }
         Err(_) => (0, 0, 0, false),
     };
-    let warning = (!playable).then(|| match &info {
-        Ok(i) => {
-            let codecs: Vec<&str> = i.audio.iter().map(|a| a.codec.as_str()).chain(i.video.iter().map(|v| v.codec.as_str())).collect();
-            format!("{name} was inserted, but it can't be played ({} isn't supported yet)", codecs.join(" / "))
-        }
-        Err(e) => format!("{name} was inserted, but it can't be played ({e})"),
-    });
     let decodable_video = info.as_ref().is_ok_and(|i| i.video.as_ref().is_some_and(|v| v.decodable));
+    let warning = if !playable {
+        Some(match &info {
+            Ok(i) => {
+                let codecs: Vec<&str> = i.audio.iter().map(|a| a.codec.as_str()).chain(i.video.iter().map(|v| v.codec.as_str())).collect();
+                format!("{name} was inserted, but it can't be played ({} isn't supported yet)", codecs.join(" / "))
+            }
+            Err(e) => format!("{name} was inserted, but it can't be played ({e})"),
+        })
+    } else if video && !decodable_video {
+        // A video codec without a decoder (VP8, say): the clip's audio still plays, but no frame
+        // can ever show — say so instead of leaving an unexplained black box (#1237).
+        info.as_ref()
+            .ok()
+            .and_then(|i| i.video.as_ref())
+            .map(|v| format!("{name} was inserted, but its video can't be played ({} isn't supported yet); only the audio plays", v.codec))
+    } else {
+        None
+    };
     let poster_png = if video && decodable_video { super::media::poster_png(&bytes, 0) } else { None };
     let size = s.doc()?.doc.slide_size;
     let rect = rect_param(p, "rect").unwrap_or_else(|| {

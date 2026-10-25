@@ -136,12 +136,15 @@ fn pattern_gallery_shows_which_swatch_has_keyboard_focus() {
     assert!(outlined(&h), "the focused swatch is outlined");
 }
 
+/// A solid fill shows its transparency slider and does not expose a pattern gallery.
 #[test]
 fn shape_solid_fill_keeps_its_transparency_without_a_pattern_gallery() {
     let (mut s, _) = patterned_shape();
     s.execute("shape.fill", &json!({"color": "accent2"})).unwrap();
     let h = harness(SlideApp::new(s, Services::default()), "format");
-    let _ = h.get_by_label("Transparency");
+    // 0.37 exposes the slider's numeric entry as a SpinButton with the same name; the slider is
+    // the control the user drags.
+    let _ = h.get_by_role_and_label(Role::Slider, "Transparency");
     assert!(h.query_by_label("Foreground color").is_none());
     assert!(h.query_by_label("Zig zag").is_none());
 }

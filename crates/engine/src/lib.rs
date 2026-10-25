@@ -155,6 +155,11 @@ pub struct Selection {
     pub text: Option<TextSel>,
     /// Selected table cells: (table, (r0, c0), (r1, c1)).
     pub cells: Option<(ShapeId, (usize, usize), (usize, usize))>,
+    /// Slide-list range last made with Shift-click: `(anchor, end)`. A further Shift-click extends from
+    /// the anchor while the current slide is still `end`; moving to another slide drops it. Held as
+    /// slide ids, so moving, inserting or deleting slides can't make it name other slides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range_anchor: Option<(SlideId, SlideId)>,
     pub target: Target,
 }
 
@@ -353,6 +358,9 @@ pub struct Prefs {
     pub undo_limit: usize,
     /// Minutes between AutoRecover saves of unsaved presentations.
     pub recovery_minutes: f64,
+    /// The unit the rulers, the Format pane and the size dialogs show (Preferences); the deck
+    /// itself always stores points.
+    pub units: deckcraft_geom::Unit,
 }
 
 impl Default for Prefs {
@@ -376,6 +384,7 @@ impl Default for Prefs {
             author: "Presenter".into(),
             undo_limit: 500,
             recovery_minutes: 1.0,
+            units: deckcraft_geom::Unit::Inches,
         }
     }
 }
@@ -493,6 +502,8 @@ pub struct Session {
     /// Presentations a host read off the UI thread, waiting for `file.adopt` (by token).
     loaded: Vec<(u64, cmd::file::LoadedFile)>,
     next_loaded: u64,
+    /// Compositions the application settled itself (see [`Session::composition_settles`]).
+    composition_settles: u64,
 }
 
 impl Default for Session {
@@ -502,6 +513,8 @@ impl Default for Session {
 }
 
 impl Session {
+    /// Install the process panic hook and construct an empty session with default preferences,
+    /// clipboard, tool state, and no active document.
     pub fn new() -> Self {
         guard::install_panic_hook();
         Session {
@@ -524,6 +537,7 @@ impl Session {
             panics_caught: 0,
             loaded: vec![],
             next_loaded: 0,
+            composition_settles: 0,
         }
     }
     /// Hand over a presentation read on another thread ([`cmd::file::read_presentation_file`]);
@@ -610,11 +624,13 @@ impl Session {
         self.guarded(id, |s| s.execute_unguarded(id, params))
     }
 
+    /// Resolve and run a command, settling composition first, checking eligibility, rolling back a
+    /// failed outer command, and committing the resulting undo entry or journal record.
     fn execute_unguarded(&mut self, id: &str, params: &Value) -> Result<Value> {
         let spec = find_command(id).ok_or_else(|| EngineError::UnknownCommand(id.into()))?;
         // Any other edit (or a click, a key, undo) settles an input method's composition first.
         if self.depth == 0 && (spec.journal || spec.undoable) && !matches!(id, "text.compose" | "text.commit") {
-            self.end_composition();
+            self.settle_composition();
         }
         if let Err(e) = (spec.enabled)(self) {
             let named = (e == cmd::NOTHING_SELECTED || e == cmd::SELECT_TWO) && (params.get("ids").is_some() || params.get("id").is_some());
@@ -688,6 +704,9 @@ impl Session {
 
     /// Keep an input method's composition as it stands (#101): its text stays and the whole
     /// composition becomes one undo step. Nothing happens without one.
+    ///
+    /// This is also how the input method's own commit ends a composition: the platform has
+    /// already finished that one, so it must not ask for an interrupt.
     pub fn end_composition(&mut self) {
         let vertex_kind = self.tool.vertex_kind.clone();
         let Some(st) = self.active_mut() else { return };
@@ -695,6 +714,27 @@ impl Session {
         if !Arc::ptr_eq(&c.before, &st.doc) {
             push_undo(st, HistoryEntry { label: "Type Text".into(), doc: c.before, selection: c.before_selection, vertex_kind });
         }
+    }
+
+    /// Settle a composition because the application did something else (a click, a key, a
+    /// command, a target change) rather than because the input method committed it.
+    ///
+    /// The platform still holds its own copy of that composition, so a host must publish one
+    /// `should_interrupt_composition` for each increment of [`Self::composition_settles`]: the
+    /// backend then cancels it instead of committing its text into whatever is selected next.
+    pub fn settle_composition(&mut self) {
+        if self.active().is_some_and(|d| d.composition.is_some()) {
+            self.composition_settles = self.composition_settles.wrapping_add(1);
+        }
+        self.end_composition();
+    }
+
+    /// How many compositions the application settled itself (clicks, keys, other commands).
+    ///
+    /// A host compares this with the value it last published; every increment is one platform
+    /// composition that must be interrupted. The input method's own commits do not count.
+    pub fn composition_settles(&self) -> u64 {
+        self.composition_settles
     }
 
     /// Change only the selection (no undo step).
@@ -712,7 +752,7 @@ impl Session {
         st.revision += 1;
         // A composition belongs to the text body it began in: leaving that body settles it.
         if st.composition.is_some() && owner(&st.selection) != before {
-            self.end_composition();
+            self.settle_composition();
         }
         Ok(())
     }

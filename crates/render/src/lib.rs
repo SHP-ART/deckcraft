@@ -321,6 +321,13 @@ pub struct Renderer {
     group_fill: Option<(Fill, Affine, Rect)>,
     /// Their aligned outlines, kept from frame to frame.
     morphs: morph_path::Cache,
+    /// Whether we are currently drawing an outer-shadow silhouette pass for an ancestor group.
+    in_shadow_pass: bool,
+    /// Cumulative shape traversal counter to prevent nested group amplification DoS.
+    render_work: usize,
+    /// Visits spent on outer-shadow silhouette passes, kept apart so they cannot use up the budget
+    /// of the normal drawing that follows.
+    shadow_work: usize,
 }
 
 impl Default for Renderer {
@@ -333,6 +340,9 @@ impl Default for Renderer {
             view: Affine::IDENTITY,
             group_fill: None,
             morphs: morph_path::Cache::default(),
+            in_shadow_pass: false,
+            render_work: 0,
+            shadow_work: 0,
         }
     }
 }
@@ -678,6 +688,9 @@ impl Renderer {
     }
 
     fn slide(&mut self, pres: &Presentation, slide: &Slide, index: usize, opts: &RenderOpts) -> Image {
+        self.render_work = 0;
+        self.shadow_work = 0;
+        self.in_shadow_pass = false;
         let (mut ctx, w, h, view) = Self::canvas(pres, opts, needs_filters(pres, slide));
         let f = Frame { pres, opts, fields: Self::fields(pres, index, opts) };
         if let Some(rctx) = Ctx::for_slide(pres, slide) {
@@ -690,6 +703,9 @@ impl Renderer {
     }
 
     fn slide_part(&mut self, pres: &Presentation, slide: &Slide, index: usize, part: SlidePart, opts: &RenderOpts) -> Image {
+        self.render_work = 0;
+        self.shadow_work = 0;
+        self.in_shadow_pass = false;
         let (mut ctx, w, h, view) = Self::canvas(pres, opts, needs_filters(pres, slide));
         let f = Frame { pres, opts, fields: Self::fields(pres, index, opts) };
         if let Some(rctx) = Ctx::for_slide(pres, slide) {
@@ -721,6 +737,9 @@ impl Renderer {
         opts: &RenderOpts,
     ) -> Image {
         let mix = if mix.is_finite() { mix.clamp(0.0, 1.0) } else { 1.0 };
+        self.render_work = 0;
+        self.shadow_work = 0;
+        self.in_shadow_pass = false;
         let (mut ctx, w, h, view) = Self::canvas(pres, opts, needs_filters(pres, old.0) || needs_filters(pres, new.0));
         let (Some(co), Some(cn)) = (Ctx::for_slide(pres, old.0), Ctx::for_slide(pres, new.0)) else { return self.finish(ctx, w, h) };
         // Backdrop graphics never take shape states: their ids may clash with the frame's shapes.
@@ -768,6 +787,9 @@ impl Renderer {
     }
 
     fn layout(&mut self, pres: &Presentation, mi: usize, li: Option<usize>, opts: &RenderOpts) -> Image {
+        self.render_work = 0;
+        self.shadow_work = 0;
+        self.in_shadow_pass = false;
         let (w, h) = output_size(pres, opts);
         let mut ctx = RenderContext::new_with(w, h, vello_cpu::RenderSettings { num_threads: 0, ..Default::default() });
         let view = Affine::translate((opts.offset.0, opts.offset.1)) * Affine::scale(opts.scale);
@@ -896,6 +918,11 @@ impl Renderer {
         if depth > 32 || (s.hidden && !f.opts.show_hidden) || f.opts.skip.contains(&s.id) {
             return;
         }
+        let work = if self.in_shadow_pass { &mut self.shadow_work } else { &mut self.render_work };
+        *work = work.saturating_add(1);
+        if *work > 100_000 {
+            return;
+        }
         // Footer placeholders on layouts/masters show only on slides that include them.
         let st = f.opts.state.map(|g| g(s.id)).unwrap_or_default();
         if !st.visible || st.opacity <= 0.001 {
@@ -936,7 +963,9 @@ impl Renderer {
                 // A group's outer shadow is cast by everything in it, as PowerPoint draws it: the
                 // children drawn once more under the shadow's offset, scale and skew, recoloured to
                 // the shadow colour and blurred, below the group.
-                if let Some(sh) = s.effects.as_ref().and_then(|e| e.outer_shadow.as_ref()) {
+                if !self.in_shadow_pass
+                    && let Some(sh) = s.effects.as_ref().and_then(|e| e.outer_shadow.as_ref())
+                {
                     let c = rctx.color(&sh.color, None);
                     let k = scale_of(m);
                     let d = Vec2::new(sh.dir.to_radians().cos(), sh.dir.to_radians().sin()) * sh.dist;
@@ -948,9 +977,11 @@ impl Renderer {
                         let shift = pre * m * own * m.inverse();
                         ctx.set_transform(Affine::IDENTITY);
                         ctx.push_layer(None, None, Some((c.a as f32) / 255.0), None, Some(blur(sh.blur / 3.0 * k)));
+                        self.in_shadow_pass = true;
                         for ch in children {
                             self.shape(ctx, f, rctx, ch, shift * gm, depth + 1);
                         }
+                        self.in_shadow_pass = false;
                         ctx.set_transform(Affine::IDENTITY);
                         ctx.push_layer(None, Some(peniko::BlendMode::new(peniko::Mix::Normal, peniko::Compose::SrcIn)), None, None, None);
                         ctx.set_paint(color(c.with_alpha(255), 1.0));
@@ -1022,6 +1053,51 @@ impl Renderer {
         }
         if layered {
             ctx.pop_layer();
+        }
+    }
+
+    /// Fill the filled sub-paths of `geo` (a `w` × `h` shape placed by `m`) with `fl`, faded per
+    /// sub-path by `fade`: `useBgFill` shows the slide background through the shape and `grpFill`
+    /// the group's fill.
+    #[allow(clippy::too_many_arguments)]
+    fn fill_geometry(
+        &self,
+        ctx: &mut RenderContext,
+        f: &Frame,
+        rctx: &Ctx,
+        fl: &Fill,
+        fill_ph: Option<Rgba>,
+        geo: &Geometry,
+        (w, h): (f64, f64),
+        m: Affine,
+        fade: &dyn Fn(usize) -> deckcraft_geom::morph::Fade,
+    ) {
+        for (i, sp) in geo.paths.iter().enumerate() {
+            if sp.fill == FillMode::None || fade(i).fill <= 0.0 {
+                continue;
+            }
+            ctx.set_transform(m);
+            ctx.set_fill_rule(if sp.even_odd { peniko::Fill::EvenOdd } else { peniko::Fill::NonZero });
+            match (fl, &self.bg) {
+                // `useBgFill`: the slide's background, laid out on the slide (not the
+                // shape), shows through the shape.
+                (Fill::Background, Some((bg, ph, view))) => {
+                    let slide = Rect::new(0.0, 0.0, f.pres.slide_size.width, f.pres.slide_size.height);
+                    let path = (view.inverse() * m) * sp.path.clone();
+                    paint::fill_path(ctx, rctx, bg, *ph, &path, slide, *view, sp.fill, fade(i).fill, f.pres);
+                }
+                // `grpFill`: the group's fill, laid out over the whole group.
+                (Fill::Group, _) => {
+                    if let Some((gf, gm, gbox)) = &self.group_fill
+                        && gm.determinant().abs() > 1e-12
+                    {
+                        let path = (gm.inverse() * m) * sp.path.clone();
+                        paint::fill_path(ctx, rctx, gf, None, &path, *gbox, *gm, sp.fill, fade(i).fill, f.pres);
+                    }
+                }
+                _ => paint::fill_path(ctx, rctx, fl, fill_ph, &sp.path, Rect::new(0.0, 0.0, w, h), m, sp.fill, fade(i).fill, f.pres),
+            }
+            ctx.set_fill_rule(peniko::Fill::NonZero);
         }
     }
 
@@ -1121,6 +1197,13 @@ impl Renderer {
         // Fill.
         match &s.kind {
             ShapeKind::Picture { fill: pf } => {
+                // The picture's own fill shows behind its transparent pixels, as in PowerPoint (an
+                // emphasis tint recolours it, as it does any shape's fill).
+                if s.fill.as_ref().is_some_and(|f| !f.is_none())
+                    && let Some(fl) = &fill
+                {
+                    self.fill_geometry(ctx, f, rctx, fl, fill_ph, &geo, (w, h), m, &fade);
+                }
                 ctx.set_transform(m);
                 let bounds = Rect::new(0.0, 0.0, w, h);
                 ctx.push_clip_layer(&outline);
@@ -1131,6 +1214,13 @@ impl Renderer {
             // An object DeckCraft doesn't model (an embedded OLE object, an unknown graphic): its
             // preview picture, stretched over the frame, as PowerPoint draws it.
             ShapeKind::Opaque { preview: Some(media), .. } => {
+                // An embedded object's fallback picture can carry a fill (old equation objects
+                // drawn on coloured boxes): behind the preview, as for a picture.
+                if s.fill.as_ref().is_some_and(|f| !f.is_none())
+                    && let Some(fl) = &fill
+                {
+                    self.fill_geometry(ctx, f, rctx, fl, fill_ph, &geo, (w, h), m, &fade);
+                }
                 ctx.set_transform(m);
                 let pf = deckcraft_model::style::PictureFill { media: *media, ..Default::default() };
                 paint::picture(ctx, f.pres, &pf, Rect::new(0.0, 0.0, w, h), m, None);
@@ -1155,33 +1245,7 @@ impl Renderer {
                 if let Some(fl) = &fill
                     && !(empty_ph && f.opts.edit && s.fill.is_none() && s.line.is_none() && s.style.is_none())
                 {
-                    for (i, sp) in geo.paths.iter().enumerate() {
-                        if sp.fill == FillMode::None || fade(i).fill <= 0.0 {
-                            continue;
-                        }
-                        ctx.set_transform(m);
-                        ctx.set_fill_rule(if sp.even_odd { peniko::Fill::EvenOdd } else { peniko::Fill::NonZero });
-                        match (fl, &self.bg) {
-                            // `useBgFill`: the slide's background, laid out on the slide (not the
-                            // shape), shows through the shape.
-                            (Fill::Background, Some((bg, ph, view))) => {
-                                let slide = Rect::new(0.0, 0.0, f.pres.slide_size.width, f.pres.slide_size.height);
-                                let path = (view.inverse() * m) * sp.path.clone();
-                                paint::fill_path(ctx, rctx, bg, *ph, &path, slide, *view, sp.fill, fade(i).fill, f.pres);
-                            }
-                            // `grpFill`: the group's fill, laid out over the whole group.
-                            (Fill::Group, _) => {
-                                if let Some((gf, gm, gbox)) = &self.group_fill
-                                    && gm.determinant().abs() > 1e-12
-                                {
-                                    let path = (gm.inverse() * m) * sp.path.clone();
-                                    paint::fill_path(ctx, rctx, gf, None, &path, *gbox, *gm, sp.fill, fade(i).fill, f.pres);
-                                }
-                            }
-                            _ => paint::fill_path(ctx, rctx, fl, fill_ph, &sp.path, Rect::new(0.0, 0.0, w, h), m, sp.fill, fade(i).fill, f.pres),
-                        }
-                        ctx.set_fill_rule(peniko::Fill::NonZero);
-                    }
+                    self.fill_geometry(ctx, f, rctx, fl, fill_ph, &geo, (w, h), m, &fade);
                 }
             }
         }
@@ -1925,16 +1989,21 @@ fn trim_ends(path: &BezPath, start: f64, end: f64) -> BezPath {
         && start > 0.0
     {
         let mut left = start;
-        while let Some(seg) = segs.first().copied() {
+        let mut drop_count = 0;
+        for (i, seg) in segs.iter().enumerate() {
             let l = seg.arclen(ACC);
             if l > left {
-                if let Some(s0) = segs.first_mut() {
-                    *s0 = seg.subsegment(seg.inv_arclen(left, ACC)..1.0);
-                }
+                let partial = seg.subsegment(seg.inv_arclen(left, ACC)..1.0);
+                segs.drain(..i);
+                segs[0] = partial;
+                drop_count = 0;
                 break;
             }
             left -= l;
-            segs.remove(0);
+            drop_count = i + 1;
+        }
+        if drop_count > 0 {
+            segs.drain(..drop_count);
         }
     }
     if let Some((segs, false)) = subs.last_mut()
@@ -2243,6 +2312,20 @@ pub(crate) fn fill_deco(ctx: &mut RenderContext, d: &deckcraft_text::Deco) {
 
 /// The line of paragraph `para` holding a glyph on baseline `y` (the nearest baseline).
 fn line_at(l: &deckcraft_text::TextLayout, para: usize, y: f64) -> usize {
+    if let Some(&(first, count)) = l.para_lines.get(para) {
+        if count == 0 {
+            return 0;
+        }
+        let end = (first + count).min(l.lines.len());
+        if first < end {
+            return l.lines[first..end]
+                .iter()
+                .enumerate()
+                .min_by(|a, b| (a.1.baseline - y).abs().total_cmp(&(b.1.baseline - y).abs()))
+                .map(|(i, _)| first + i)
+                .unwrap_or(0);
+        }
+    }
     l.lines
         .iter()
         .enumerate()

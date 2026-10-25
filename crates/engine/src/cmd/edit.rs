@@ -7,7 +7,10 @@ use deckcraft_model::text::TextBody;
 use deckcraft_model::{MediaId, Shape, ShapeId, Slide, SlideId};
 use serde_json::{Value, json};
 
-use super::*;
+use super::{
+    CommandSpec, NO_ID_SPACE, bad, base64_encode, bool_or, can_redo, can_undo, cmd, has_doc, has_selection, has_slide, id_param, ids_param, ok,
+    richclip, str_param, targets, xfrm_of,
+};
 use crate::{HistoryEntry, Result, Session};
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -318,7 +321,18 @@ fn paste(s: &mut Session, p: &Value) -> Result<Value> {
             let mut shapes = clip.shapes.clone();
             reid("edit.paste", doc, &mut shapes)?;
             crate::media_refs::visit_mut::shapes(&mut shapes, &mut remap_media(&media));
+            let mut taken = super::current_names(doc, sel);
             for sh in &mut shapes {
+                // Only a name already on the slide is changed (two shapes with one name are what the
+                // issue is about); otherwise it stays, as Morph pairs shapes across slides by name.
+                if taken.contains(&sh.name)
+                    && let Some((base, n)) = sh.name.rsplit_once(' ')
+                    && !n.is_empty()
+                    && n.bytes().all(|b| b.is_ascii_digit())
+                {
+                    sh.name = super::insert::first_free_name(base, &taken);
+                }
+                taken.insert(sh.name.clone());
                 if let Some(x) = sh.xfrm.as_mut() {
                     x.x += off;
                     x.y += off;

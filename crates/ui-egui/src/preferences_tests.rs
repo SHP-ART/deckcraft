@@ -2,7 +2,7 @@
 //! window's close button put the settings back the way they were (#752, reported as #878).
 
 use deckcraft_engine::Session;
-use egui_kittest::kittest::{NodeT, Queryable};
+use egui_kittest::kittest::Queryable;
 use egui_kittest::{Harness, Node};
 use serde_json::json;
 
@@ -11,7 +11,10 @@ use crate::{Services, SlideApp};
 
 /// The slider itself, not the label drawn beside it.
 fn interface_size<'a>(h: &'a Harness<'_, SlideApp>) -> Node<'a> {
-    h.get_all_by_label("Interface size").find(|n| n.accesskit_node().role() == egui::accesskit::Role::Slider).expect("the slider is there")
+    let mut sliders = h.query_all_by_role_and_label(egui::accesskit::Role::Slider, "Interface size");
+    let slider = sliders.next().expect("the slider is there");
+    assert!(sliders.next().is_none(), "exactly one Interface size slider");
+    slider
 }
 
 fn harness() -> Harness<'static, SlideApp> {

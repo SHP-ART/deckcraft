@@ -355,6 +355,11 @@ pub(crate) fn with_param(p: &Value, key: &str, v: Value) -> Value {
 
 /// Targets: `ids` / `id` params, else the selection.
 pub(crate) fn targets(s: &Session, p: &Value) -> Result<Vec<ShapeId>> {
+    if let Some(a) = p.get("ids").and_then(Value::as_array)
+        && let Some(v) = a.iter().find(|v| v.as_u64().and_then(|v| u32::try_from(v).ok()).is_none())
+    {
+        return Err(bad("shape", format!("`ids` has an invalid shape id: {v}")));
+    }
     if let Some(ids) = ids_param(p, "ids")
         && !ids.is_empty()
     {
@@ -508,6 +513,10 @@ pub(crate) fn current_shapes<'a>(doc: &'a deckcraft_model::Presentation, sel: &c
         t @ (crate::Target::Handout | crate::Target::NotesMaster) => crate::page_master(doc, t).map(|m| &m.shapes),
         crate::Target::Layout { master, layout } => doc.masters.get(master).and_then(|m| m.layouts.get(layout)).map(|l| &l.shapes),
     }
+}
+
+pub(crate) fn current_names(doc: &deckcraft_model::Presentation, sel: &crate::Selection) -> std::collections::HashSet<String> {
+    current_shapes(doc, sel).map(|v| v.iter().map(|s| s.name.clone()).collect()).unwrap_or_default()
 }
 
 /// The command palette runs a command with `{}`. True when the params doc names a value that

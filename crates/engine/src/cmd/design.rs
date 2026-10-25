@@ -10,7 +10,10 @@ use deckcraft_model::theme::{builtin_color_schemes, builtin_font_schemes, builti
 use deckcraft_model::{Background, Fill, PhType, Presentation, Shape, ShapeId, defaults};
 use serde_json::{Value, json};
 
-use super::*;
+use super::{
+    CommandSpec, NO_ID_SPACE, always, bad, bool_or, bool_param, cmd, color_param, color_value, f64_param, has_doc, has_slide, ok, opt_usize_param,
+    rect_param, str_param, usize_param, with_param,
+};
 use crate::{Result, Session, Target};
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -1344,17 +1347,17 @@ fn insert_layout(s: &mut Session, p: &Value) -> Result<Value> {
     })
 }
 
-fn layout_target(s: &Session, p: &Value) -> Result<(usize, usize)> {
+fn layout_target(s: &Session, p: &Value, cmd: &str) -> Result<(usize, usize)> {
     let st = s.doc()?;
     let (m, l) = match st.selection.target {
         Target::Layout { master, layout } => (master, layout),
         _ => (master_index(&st.doc, &st.selection), 0),
     };
-    Ok((usize_param(p, "master").unwrap_or(m), usize_param(p, "layout").unwrap_or(l)))
+    Ok((opt_usize_param(p, "master", cmd)?.unwrap_or(m), opt_usize_param(p, "layout", cmd)?.unwrap_or(l)))
 }
 
 fn rename_layout(s: &mut Session, p: &Value) -> Result<Value> {
-    let (mi, li) = layout_target(s, p)?;
+    let (mi, li) = layout_target(s, p, "master.renameLayout")?;
     let name = str_param(p, "name").ok_or_else(|| bad("master.renameLayout", "missing `name`"))?.to_string();
     s.edit(|doc, _| {
         let l =
@@ -1366,7 +1369,7 @@ fn rename_layout(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn delete_layout(s: &mut Session, p: &Value) -> Result<Value> {
-    let (mi, li) = layout_target(s, p)?;
+    let (mi, li) = layout_target(s, p, "master.deleteLayout")?;
     s.edit(|doc, sel| {
         let id = doc.masters.get(mi).and_then(|m| m.layouts.get(li)).map(|l| l.id).ok_or_else(|| bad("master.deleteLayout", "no such layout"))?;
         if doc.slides.iter().any(|x| x.layout == id) {
@@ -1617,6 +1620,25 @@ mod tests {
             Some(Background::Fill { fill: Fill::Picture(pf) }) => pf.clone(),
             other => panic!("expected a picture background, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn layout_commands_reject_invalid_index() {
+        let mut s = Session::with_new();
+        s.execute("master.insertLayout", &json!({})).unwrap();
+        let count = |s: &Session| s.doc().unwrap().doc.masters.iter().map(|m| m.layouts.len()).sum::<usize>();
+        let names = |s: &Session| s.doc().unwrap().doc.masters.iter().flat_map(|m| m.layouts.iter().map(|l| l.name.clone())).collect::<Vec<_>>();
+        let n = count(&s);
+        let before = names(&s);
+        for bad in [json!(-1), json!(1.5)] {
+            assert!(s.execute("master.deleteLayout", &json!({"layout": bad})).is_err());
+            assert!(s.execute("master.deleteLayout", &json!({"master": bad})).is_err());
+            assert!(s.execute("master.renameLayout", &json!({"layout": bad, "name": "x"})).is_err());
+            assert_eq!(count(&s), n);
+            assert_eq!(names(&s), before);
+        }
+        s.execute("master.deleteLayout", &json!({})).unwrap();
+        assert_eq!(count(&s), n - 1);
     }
 
     #[test]
