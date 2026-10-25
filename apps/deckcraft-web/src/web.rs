@@ -1,5 +1,8 @@
 //! The browser shell: web `Services`, drag-and-drop, and the eframe web runner.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use deckcraft_engine::Session;
 use deckcraft_ui_egui::{Inbox, InboxEvent, InboxFile, Services, SlideApp};
 use wasm_bindgen::JsCast as _;
@@ -28,6 +31,8 @@ pub fn start() {
         {
             create.instance_descriptor.backends = eframe::wgpu::Backends::GL;
         }
+        let page_query = query();
+        let nextcloud = Rc::new(RefCell::new(crate::nextcloud::path_from_query(&page_query)));
         let result = eframe::WebRunner::new()
             .start(
                 canvas,
@@ -37,9 +42,20 @@ pub fn start() {
                         log::info!("deckcraft-web {}: wgpu backend {:?}", env!("CARGO_PKG_VERSION"), rs.adapter.get_info().backend);
                     }
                     let inbox: Inbox = Inbox::default();
-                    let mut app = SlideApp::new(Session::new(), services(inbox.clone(), cc.egui_ctx.clone()));
-                    let q = query();
-                    if !q.contains("blank") {
+                    let mut app = SlideApp::new(Session::new(), services(inbox.clone(), cc.egui_ctx.clone(), nextcloud.clone()));
+                    app.nextcloud_path = nextcloud.borrow().clone();
+                    let q = page_query.clone();
+                    let has_nc = nextcloud.borrow().is_some();
+                    if has_nc {
+                        // A Nextcloud path starts with an empty presentation; the file is loaded
+                        // asynchronously and, if missing (404), left empty so Save creates it.
+                        if let Err(e) = app.run("file.new", serde_json::json!({})) {
+                            log::error!("new presentation: {e}");
+                        }
+                        if let Some(path) = nextcloud.borrow().as_deref() {
+                            open_from_nextcloud(path.to_string(), inbox.clone(), cc.egui_ctx.clone());
+                        }
+                    } else if !q.contains("blank") {
                         if let Err(e) = deckcraft_engine::sample::open_sample(&mut app.session) {
                             log::error!("sample deck: {e}");
                         }
@@ -111,8 +127,13 @@ impl eframe::App for WebShell {
 
 /// Web services: no file paths, so `pick_open`/`pick_save`/`read` stay `None` and the UI falls
 /// back to `open_async` (browser picker → inbox) and `download`.
-fn services(inbox: Inbox, ctx: egui::Context) -> Services {
+fn services(inbox: Inbox, ctx: egui::Context, nextcloud: Rc<RefCell<Option<String>>>) -> Services {
     let open_inbox = inbox.clone();
+    let _picture_ctx = ctx.clone();
+    let write_ctx = ctx.clone();
+    let download_ctx = ctx.clone();
+    let write_nextcloud = nextcloud.clone();
+    let download_nextcloud = nextcloud;
     Services {
         open_async: Some(Box::new(move |purpose: &str, request: u64| {
             let inbox = open_inbox.clone();
@@ -134,9 +155,16 @@ fn services(inbox: Inbox, ctx: egui::Context) -> Services {
                 ctx.request_repaint();
             });
         })),
-        write: Some(Box::new(|name: &str, bytes: &[u8]| download(name, bytes))),
-        download: Some(Box::new(|name: &str, bytes: &[u8]| {
-            if let Err(e) = download(name, bytes) {
+        write: Some(Box::new(move |name: &str, bytes: &[u8]| match crate::nextcloud::save_target(write_nextcloud.borrow().as_deref(), name) {
+            Some(target) => save_to_nextcloud(&write_ctx, target, bytes),
+            None => download(name, bytes),
+        })),
+        download: Some(Box::new(move |name: &str, bytes: &[u8]| {
+            if let Some(target) = crate::nextcloud::save_target(download_nextcloud.borrow().as_deref(), name) {
+                if let Err(e) = save_to_nextcloud(&download_ctx, target, bytes) {
+                    log::error!("Nextcloud save failed: {e}");
+                }
+            } else if let Err(e) = download(name, bytes) {
                 log::error!("download of {name} failed: {e}");
             }
         })),
@@ -147,6 +175,64 @@ fn services(inbox: Inbox, ctx: egui::Context) -> Services {
 
 fn push_inbox(inbox: &Inbox, event: InboxEvent) {
     inbox.lock().unwrap_or_else(|e| e.into_inner()).push(event);
+}
+
+/// Load `path` through the Nextcloud passage into the inbox, as if it had been picked.
+fn open_from_nextcloud(path: String, inbox: Inbox, ctx: egui::Context) {
+    wasm_bindgen_futures::spawn_local(async move {
+        let result: Result<Option<Vec<u8>>, String> = async {
+            let window = web_sys::window().ok_or("no window")?;
+            let resp: web_sys::Response = wasm_bindgen_futures::JsFuture::from(window.fetch_with_str(&crate::nextcloud::url_for(&path)))
+                .await
+                .map_err(|e| format!("{e:?}"))?
+                .dyn_into()
+                .map_err(|_| "no response".to_string())?;
+            let status = resp.status();
+            if status == 404 {
+                return Ok(None);
+            }
+            if !resp.ok() {
+                return Err(format!("HTTP {status}"));
+            }
+            let buf = wasm_bindgen_futures::JsFuture::from(resp.array_buffer().map_err(|e| format!("{e:?}"))?).await.map_err(|e| format!("{e:?}"))?;
+            Ok(Some(js_sys::Uint8Array::new(&buf).to_vec()))
+        }
+        .await;
+        match result {
+            Ok(Some(bytes)) => {
+                let name = crate::nextcloud::file_name(&path).to_string();
+                push_inbox(&inbox, InboxEvent::File(InboxFile { id: 0, name, bytes }));
+            }
+            Ok(None) => {
+                log::info!("Nextcloud path does not exist yet; starting empty: {path}");
+            }
+            Err(e) => {
+                log::error!("couldn't load {path} from Nextcloud: {e}");
+            }
+        }
+        ctx.request_repaint();
+    });
+}
+
+/// Write `bytes` to `path` in Nextcloud (HTTP PUT through the passage).
+fn save_to_nextcloud(ctx: &egui::Context, path: String, bytes: &[u8]) -> Result<(), String> {
+    let window = web_sys::window().ok_or("no window")?;
+    let init = web_sys::RequestInit::new();
+    init.set_method("PUT");
+    init.set_body(&js_sys::Uint8Array::from(bytes).into());
+    let prom = window.fetch_with_str_and_init(&crate::nextcloud::url_for(&path), &init);
+    let ctx = ctx.clone();
+    wasm_bindgen_futures::spawn_local(async move {
+        let outcome = match wasm_bindgen_futures::JsFuture::from(prom).await.map(|r| r.dyn_into::<web_sys::Response>()) {
+            Ok(Ok(resp)) if resp.ok() => log::info!("In Nextcloud gespeichert: {path}"),
+            Ok(Ok(resp)) => log::error!("Nextcloud hat das Speichern abgelehnt (HTTP {})", resp.status()),
+            Ok(Err(_)) => log::error!("Nextcloud: keine Antwort"),
+            Err(e) => log::error!("Nextcloud nicht erreichbar: {e:?}"),
+        };
+        let _ = outcome;
+        ctx.request_repaint();
+    });
+    Ok(())
 }
 
 /// Trigger a browser download of `bytes` named after the last component of `path`.

@@ -517,6 +517,9 @@ pub struct SlideApp {
     pub(crate) slides_focused: bool,
     /// A V key press or a Paste event arrived since the last V release (see `keyboard`).
     v_seen: bool,
+    /// Full Nextcloud path when opened via `?nc=<path>` in the web shell. Used to write Save back
+    /// to Nextcloud instead of downloading.
+    pub nextcloud_path: Option<String>,
     /// Which recent paths exist on disk, probed once per path per session (a dead network share
     /// must not stall every frame). Not persisted.
     recent_checked: HashMap<String, bool>,
@@ -596,6 +599,7 @@ impl SlideApp {
             twisting: false,
             next_file_id: 1,
             pending_files: Vec::new(),
+            nextcloud_path: None,
         }
     }
 
